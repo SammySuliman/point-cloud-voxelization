@@ -11,8 +11,10 @@ Void ratio is computed as:
 
     e = (V_voxel - sum(V_sphere_particles_in_voxel)) / sum(V_sphere)
 
-Sphere volumes are assigned to the voxel containing each particle center; this
-does not clip spheres against voxel boundaries.
+Sphere volumes are assigned to the voxel containing each particle center.
+Interior voxels use the full cubic voxel volume. Boundary voxels are shortened
+on their outside face(s) to the local sphere extent of the particles assigned to
+that boundary voxel, reducing artificial empty space outside the particle cloud.
 """
 
 from __future__ import print_function
@@ -169,13 +171,46 @@ def compute_void_ratio_numpy(points, radii, target_particles_per_voxel):
     indices = np.minimum(indices, dims - 1)
     linear = indices[:, 0] + dims[0] * (indices[:, 1] + dims[1] * indices[:, 2])
 
-    unique_linear, inverse = np.unique(linear, return_inverse=True)
+    unique_linear, unique_first, inverse = np.unique(
+        linear, return_index=True, return_inverse=True
+    )
+    voxel_indices = indices[unique_first]
     sphere_volumes = (4.0 / 3.0) * math.pi * np.power(radii, 3)
     solid_by_voxel = np.bincount(inverse, weights=sphere_volumes)
     counts_by_voxel = np.bincount(inverse)
 
-    voxel_volume = voxel_size ** 3
-    void_by_voxel = (voxel_volume - solid_by_voxel) / solid_by_voxel
+    nominal_voxel_volume = voxel_size ** 3
+    lower_sphere_extent = points - radii[:, None]
+    upper_sphere_extent = points + radii[:, None]
+    local_min = np.full((solid_by_voxel.shape[0], 3), np.inf, dtype=np.float64)
+    local_max = np.full((solid_by_voxel.shape[0], 3), -np.inf, dtype=np.float64)
+    for axis in range(3):
+        np.minimum.at(local_min[:, axis], inverse, lower_sphere_extent[:, axis])
+        np.maximum.at(local_max[:, axis], inverse, upper_sphere_extent[:, axis])
+
+    lengths = np.full((solid_by_voxel.shape[0], 3), voxel_size, dtype=np.float64)
+    for axis in range(3):
+        nominal_low = mins[axis] + voxel_indices[:, axis] * voxel_size
+        nominal_high = nominal_low + voxel_size
+        adjusted_low = nominal_low.copy()
+        adjusted_high = nominal_high.copy()
+
+        low_boundary = voxel_indices[:, axis] == 0
+        high_boundary = voxel_indices[:, axis] == dims[axis] - 1
+        adjusted_low[low_boundary] = np.maximum(
+            adjusted_low[low_boundary], local_min[low_boundary, axis]
+        )
+        adjusted_high[high_boundary] = np.minimum(
+            adjusted_high[high_boundary], local_max[high_boundary, axis]
+        )
+        lengths[:, axis] = np.maximum(adjusted_high - adjusted_low, 0.0)
+
+    measurement_volume_by_voxel = np.prod(lengths, axis=1)
+    adjusted_boundary_voxels = int(
+        np.count_nonzero(measurement_volume_by_voxel < nominal_voxel_volume)
+    )
+
+    void_by_voxel = (measurement_volume_by_voxel - solid_by_voxel) / solid_by_voxel
     void_by_particle = void_by_voxel[inverse]
 
     stats = {
@@ -184,6 +219,11 @@ def compute_void_ratio_numpy(points, radii, target_particles_per_voxel):
         "bounds_max": [float(v) for v in maxs],
         "extents": [float(v) for v in (maxs - mins)],
         "voxel_size": float(voxel_size),
+        "nominal_voxel_volume": float(nominal_voxel_volume),
+        "min_measurement_volume": float(measurement_volume_by_voxel.min()),
+        "median_measurement_volume": float(np.median(measurement_volume_by_voxel)),
+        "max_measurement_volume": float(measurement_volume_by_voxel.max()),
+        "adjusted_boundary_voxels": adjusted_boundary_voxels,
         "dims": [int(v) for v in dims],
         "total_voxels": int(dims[0] * dims[1] * dims[2]),
         "occupied_voxels": int(occupied),
@@ -228,9 +268,11 @@ def compute_void_ratio_plain(points, radii, target_particles_per_voxel):
             lo = size
 
     voxel_size, dims, occupied_count, average = best
-    voxel_volume = voxel_size ** 3
+    nominal_voxel_volume = voxel_size ** 3
     solid_by_voxel = {}
     count_by_voxel = {}
+    local_min_by_voxel = {}
+    local_max_by_voxel = {}
     particle_keys = []
 
     for point, radius in zip(points, radii):
@@ -242,15 +284,42 @@ def compute_void_ratio_plain(points, radii, target_particles_per_voxel):
         particle_keys.append(key)
         solid_by_voxel[key] = solid_by_voxel.get(key, 0.0) + (4.0 / 3.0) * math.pi * radius ** 3
         count_by_voxel[key] = count_by_voxel.get(key, 0) + 1
+        lower = (point[0] - radius, point[1] - radius, point[2] - radius)
+        upper = (point[0] + radius, point[1] + radius, point[2] + radius)
+        if key not in local_min_by_voxel:
+            local_min_by_voxel[key] = list(lower)
+            local_max_by_voxel[key] = list(upper)
+        else:
+            for axis in range(3):
+                local_min_by_voxel[key][axis] = min(local_min_by_voxel[key][axis], lower[axis])
+                local_max_by_voxel[key][axis] = max(local_max_by_voxel[key][axis], upper[axis])
 
     void_by_voxel = {}
+    measurement_volumes = []
+    adjusted_boundary_voxels = 0
     for key, solid in solid_by_voxel.items():
-        void_by_voxel[key] = (voxel_volume - solid) / solid
+        lengths = []
+        for axis in range(3):
+            nominal_low = mins[axis] + key[axis] * voxel_size
+            nominal_high = nominal_low + voxel_size
+            adjusted_low = nominal_low
+            adjusted_high = nominal_high
+            if key[axis] == 0:
+                adjusted_low = max(adjusted_low, local_min_by_voxel[key][axis])
+            if key[axis] == dims[axis] - 1:
+                adjusted_high = min(adjusted_high, local_max_by_voxel[key][axis])
+            lengths.append(max(adjusted_high - adjusted_low, 0.0))
+        measurement_volume = lengths[0] * lengths[1] * lengths[2]
+        if measurement_volume < nominal_voxel_volume:
+            adjusted_boundary_voxels += 1
+        measurement_volumes.append(measurement_volume)
+        void_by_voxel[key] = (measurement_volume - solid) / solid
 
     void_by_particle = [void_by_voxel[key] for key in particle_keys]
     void_values = list(void_by_voxel.values())
     counts = list(count_by_voxel.values())
     void_sorted = sorted(void_values)
+    measurement_sorted = sorted(measurement_volumes)
 
     stats = {
         "point_count": len(points),
@@ -258,6 +327,11 @@ def compute_void_ratio_plain(points, radii, target_particles_per_voxel):
         "bounds_max": maxs,
         "extents": extents,
         "voxel_size": voxel_size,
+        "nominal_voxel_volume": nominal_voxel_volume,
+        "min_measurement_volume": min(measurement_volumes),
+        "median_measurement_volume": measurement_sorted[len(measurement_sorted) // 2],
+        "max_measurement_volume": max(measurement_volumes),
+        "adjusted_boundary_voxels": adjusted_boundary_voxels,
         "dims": dims,
         "total_voxels": dims[0] * dims[1] * dims[2],
         "occupied_voxels": occupied_count,
@@ -407,6 +481,15 @@ def print_stats(stats, output_path, version_text):
     print("Bounds max: {0}".format(stats["bounds_max"]))
     print("Extents: {0}".format(stats["extents"]))
     print("Voxel size: {0:.12g}".format(stats["voxel_size"]))
+    print("Nominal full voxel volume: {0:.12g}".format(stats["nominal_voxel_volume"]))
+    print(
+        "Measurement volume min/median/max: {0:.6g} / {1:.6g} / {2:.6g}".format(
+            stats["min_measurement_volume"],
+            stats["median_measurement_volume"],
+            stats["max_measurement_volume"],
+        )
+    )
+    print("Boundary voxels adjusted: {0}".format(stats["adjusted_boundary_voxels"]))
     print("Voxel dimensions: {0}".format(stats["dims"]))
     print("Total voxels in extent grid: {0}".format(stats["total_voxels"]))
     print("Occupied voxels: {0}".format(stats["occupied_voxels"]))
