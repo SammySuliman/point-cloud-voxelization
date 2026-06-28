@@ -15,6 +15,8 @@ Sphere volumes are assigned to the voxel containing each particle center.
 Interior voxels use the full cubic voxel volume. Boundary voxels are shortened
 on their outside face(s) to the local sphere extent of the particles assigned to
 that boundary voxel, reducing artificial empty space outside the particle cloud.
+A second point-data field stores a Gaussian-smoothed void ratio over occupied
+neighboring voxels.
 """
 
 from __future__ import print_function
@@ -130,6 +132,75 @@ def load_points_and_radii(polydata, radius_array):
     return coords, radii
 
 
+def gaussian_smooth_occupied_numpy(voxel_indices, values_by_voxel, dims, sigma):
+    import numpy as np
+
+    if sigma <= 0.0:
+        return values_by_voxel.copy()
+
+    radius = int(math.ceil(3.0 * sigma))
+    shape = tuple(int(v) for v in dims)
+    values_grid = np.zeros(shape, dtype=np.float64)
+    occupied_grid = np.zeros(shape, dtype=np.float64)
+    coords = tuple(voxel_indices[:, axis] for axis in range(3))
+    values_grid[coords] = values_by_voxel
+    occupied_grid[coords] = 1.0
+
+    weighted_sum = np.zeros(shape, dtype=np.float64)
+    weight_sum = np.zeros(shape, dtype=np.float64)
+
+    for dx in range(-radius, radius + 1):
+        for dy in range(-radius, radius + 1):
+            for dz in range(-radius, radius + 1):
+                distance_sq = dx * dx + dy * dy + dz * dz
+                weight = math.exp(-distance_sq / (2.0 * sigma * sigma))
+
+                target_slices = []
+                source_slices = []
+                for offset, size in ((dx, shape[0]), (dy, shape[1]), (dz, shape[2])):
+                    if offset >= 0:
+                        target_slices.append(slice(offset, size))
+                        source_slices.append(slice(0, size - offset))
+                    else:
+                        target_slices.append(slice(0, size + offset))
+                        source_slices.append(slice(-offset, size))
+
+                target = tuple(target_slices)
+                source = tuple(source_slices)
+                weighted_sum[target] += weight * values_grid[source] * occupied_grid[source]
+                weight_sum[target] += weight * occupied_grid[source]
+
+    smoothed_grid = np.empty(shape, dtype=np.float64)
+    np.divide(weighted_sum, weight_sum, out=smoothed_grid, where=weight_sum > 0.0)
+    smoothed_grid[weight_sum == 0.0] = values_grid[weight_sum == 0.0]
+    return smoothed_grid[coords]
+
+
+def gaussian_smooth_occupied_plain(voxel_keys, values_by_voxel, sigma):
+    if sigma <= 0.0:
+        return dict(values_by_voxel)
+
+    radius = int(math.ceil(3.0 * sigma))
+    smoothed = {}
+    offsets = []
+    for dx in range(-radius, radius + 1):
+        for dy in range(-radius, radius + 1):
+            for dz in range(-radius, radius + 1):
+                distance_sq = dx * dx + dy * dy + dz * dz
+                offsets.append((dx, dy, dz, math.exp(-distance_sq / (2.0 * sigma * sigma))))
+
+    for key in voxel_keys:
+        weighted_sum = 0.0
+        weight_sum = 0.0
+        for dx, dy, dz, weight in offsets:
+            neighbor = (key[0] + dx, key[1] + dy, key[2] + dz)
+            if neighbor in values_by_voxel:
+                weighted_sum += weight * values_by_voxel[neighbor]
+                weight_sum += weight
+        smoothed[key] = weighted_sum / weight_sum if weight_sum > 0.0 else values_by_voxel[key]
+    return smoothed
+
+
 def choose_voxel_size_numpy(points, target_particles_per_voxel):
     import numpy as np
 
@@ -161,7 +232,7 @@ def choose_voxel_size_numpy(points, target_particles_per_voxel):
     return mins, maxs, best
 
 
-def compute_void_ratio_numpy(points, radii, target_particles_per_voxel):
+def compute_void_ratio_numpy(points, radii, target_particles_per_voxel, smooth_sigma):
     import numpy as np
 
     mins, maxs, best = choose_voxel_size_numpy(points, target_particles_per_voxel)
@@ -211,13 +282,18 @@ def compute_void_ratio_numpy(points, radii, target_particles_per_voxel):
     )
 
     void_by_voxel = (measurement_volume_by_voxel - solid_by_voxel) / solid_by_voxel
+    smoothed_void_by_voxel = gaussian_smooth_occupied_numpy(
+        voxel_indices, void_by_voxel, dims, smooth_sigma
+    )
     void_by_particle = void_by_voxel[inverse]
+    smoothed_void_by_particle = smoothed_void_by_voxel[inverse]
 
     stats = {
         "point_count": int(points.shape[0]),
         "bounds_min": [float(v) for v in mins],
         "bounds_max": [float(v) for v in maxs],
         "extents": [float(v) for v in (maxs - mins)],
+        "target_particles_per_voxel": float(target_particles_per_voxel),
         "voxel_size": float(voxel_size),
         "nominal_voxel_volume": float(nominal_voxel_volume),
         "min_measurement_volume": float(measurement_volume_by_voxel.min()),
@@ -234,12 +310,16 @@ def compute_void_ratio_numpy(points, radii, target_particles_per_voxel):
         "median_void_ratio": float(np.median(void_by_voxel)),
         "max_void_ratio": float(void_by_voxel.max()),
         "negative_void_ratio_voxels": int(np.count_nonzero(void_by_voxel < 0.0)),
+        "smooth_sigma": float(smooth_sigma),
+        "min_smoothed_void_ratio": float(smoothed_void_by_voxel.min()),
+        "median_smoothed_void_ratio": float(np.median(smoothed_void_by_voxel)),
+        "max_smoothed_void_ratio": float(smoothed_void_by_voxel.max()),
         "unique_linear_voxels": unique_linear,
     }
-    return void_by_particle, stats
+    return void_by_particle, smoothed_void_by_particle, stats
 
 
-def compute_void_ratio_plain(points, radii, target_particles_per_voxel):
+def compute_void_ratio_plain(points, radii, target_particles_per_voxel, smooth_sigma):
     mins = [min(p[axis] for p in points) for axis in range(3)]
     maxs = [max(p[axis] for p in points) for axis in range(3)]
     extents = [maxs[i] - mins[i] for i in range(3)]
@@ -315,10 +395,16 @@ def compute_void_ratio_plain(points, radii, target_particles_per_voxel):
         measurement_volumes.append(measurement_volume)
         void_by_voxel[key] = (measurement_volume - solid) / solid
 
+    smoothed_void_by_voxel = gaussian_smooth_occupied_plain(
+        solid_by_voxel.keys(), void_by_voxel, smooth_sigma
+    )
     void_by_particle = [void_by_voxel[key] for key in particle_keys]
+    smoothed_void_by_particle = [smoothed_void_by_voxel[key] for key in particle_keys]
     void_values = list(void_by_voxel.values())
+    smoothed_void_values = list(smoothed_void_by_voxel.values())
     counts = list(count_by_voxel.values())
     void_sorted = sorted(void_values)
+    smoothed_void_sorted = sorted(smoothed_void_values)
     measurement_sorted = sorted(measurement_volumes)
 
     stats = {
@@ -326,6 +412,7 @@ def compute_void_ratio_plain(points, radii, target_particles_per_voxel):
         "bounds_min": mins,
         "bounds_max": maxs,
         "extents": extents,
+        "target_particles_per_voxel": float(target_particles_per_voxel),
         "voxel_size": voxel_size,
         "nominal_voxel_volume": nominal_voxel_volume,
         "min_measurement_volume": min(measurement_volumes),
@@ -342,17 +429,69 @@ def compute_void_ratio_plain(points, radii, target_particles_per_voxel):
         "median_void_ratio": void_sorted[len(void_sorted) // 2],
         "max_void_ratio": max(void_values),
         "negative_void_ratio_voxels": sum(1 for value in void_values if value < 0.0),
+        "smooth_sigma": float(smooth_sigma),
+        "min_smoothed_void_ratio": min(smoothed_void_values),
+        "median_smoothed_void_ratio": smoothed_void_sorted[len(smoothed_void_sorted) // 2],
+        "max_smoothed_void_ratio": max(smoothed_void_values),
     }
-    return void_by_particle, stats
+    return void_by_particle, smoothed_void_by_particle, stats
 
 
-def add_void_ratio_array(vtk, polydata, field_name, void_by_particle):
+def find_smallest_n_without_negative_void_ratio(
+    points, radii, search_start_n, search_limit_n
+):
+    if search_limit_n < search_start_n:
+        return None, None
+
+    use_numpy = hasattr(points, "shape")
+    for candidate_n in range(search_start_n, search_limit_n + 1):
+        if use_numpy:
+            _, _, candidate_stats = compute_void_ratio_numpy(
+                points, radii, float(candidate_n), 0.0
+            )
+        else:
+            _, _, candidate_stats = compute_void_ratio_plain(
+                points, radii, float(candidate_n), 0.0
+            )
+        if candidate_stats["negative_void_ratio_voxels"] == 0:
+            return candidate_n, candidate_stats
+    return None, None
+
+
+def add_negative_void_ratio_recommendation(points, radii, stats, search_limit_n):
+    stats["negative_n_search_limit"] = int(search_limit_n)
+    stats["nonnegative_recommended_n"] = None
+    stats["nonnegative_recommended_dims"] = None
+    stats["nonnegative_recommended_min_void_ratio"] = None
+
+    if stats["negative_void_ratio_voxels"] == 0 or search_limit_n <= 0:
+        return
+
+    current_n = stats["target_particles_per_voxel"]
+    search_start_n = max(1, int(math.ceil(current_n)))
+    if abs(float(search_start_n) - float(current_n)) < 1.0e-12:
+        search_start_n += 1
+
+    recommended_n, recommended_stats = find_smallest_n_without_negative_void_ratio(
+        points, radii, search_start_n, int(search_limit_n)
+    )
+    if recommended_n is None:
+        return
+
+    stats["nonnegative_recommended_n"] = int(recommended_n)
+    stats["nonnegative_recommended_dims"] = recommended_stats["dims"]
+    stats["nonnegative_recommended_min_void_ratio"] = recommended_stats[
+        "min_void_ratio"
+    ]
+
+
+def add_point_scalar_array(vtk, polydata, field_name, values):
     array = vtk.vtkDoubleArray()
     array.SetName(field_name)
     array.SetNumberOfComponents(1)
     array.SetNumberOfTuples(polydata.GetNumberOfPoints())
 
-    for i, value in enumerate(void_by_particle):
+    for i, value in enumerate(values):
         array.SetTuple1(i, float(value))
 
     polydata.GetPointData().AddArray(array)
@@ -480,6 +619,7 @@ def print_stats(stats, output_path, version_text):
     print("Bounds min: {0}".format(stats["bounds_min"]))
     print("Bounds max: {0}".format(stats["bounds_max"]))
     print("Extents: {0}".format(stats["extents"]))
+    print("Target particles per occupied voxel: {0:g}".format(stats["target_particles_per_voxel"]))
     print("Voxel size: {0:.12g}".format(stats["voxel_size"]))
     print("Nominal full voxel volume: {0:.12g}".format(stats["nominal_voxel_volume"]))
     print(
@@ -516,6 +656,41 @@ def print_stats(stats, output_path, version_text):
             stats["negative_void_ratio_voxels"]
         )
     )
+    if stats["negative_void_ratio_voxels"] > 0:
+        print(
+            "WARNING: Negative raw void ratios occurred for the current N. "
+            "This means assigned sphere volume exceeded adjusted voxel volume "
+            "in those voxels."
+        )
+        if stats.get("nonnegative_recommended_n") is not None:
+            print(
+                "Smallest integer N above the current N with no negative raw "
+                "void ratios: {0}".format(stats["nonnegative_recommended_n"])
+            )
+            print(
+                "Recommended N voxel dimensions: {0}".format(
+                    stats["nonnegative_recommended_dims"]
+                )
+            )
+            print(
+                "Recommended N minimum void ratio: {0:.6g}".format(
+                    stats["nonnegative_recommended_min_void_ratio"]
+                )
+            )
+        elif stats.get("negative_n_search_limit", 0) > 0:
+            print(
+                "No integer N up to {0} eliminated negative raw void ratios.".format(
+                    stats["negative_n_search_limit"]
+                )
+            )
+    print("Gaussian smoothing sigma: {0:g} voxel(s)".format(stats["smooth_sigma"]))
+    print(
+        "Smoothed void ratio min/median/max: {0:.6g} / {1:.6g} / {2:.6g}".format(
+            stats["min_smoothed_void_ratio"],
+            stats["median_smoothed_void_ratio"],
+            stats["max_smoothed_void_ratio"],
+        )
+    )
 
 
 def parse_args():
@@ -549,7 +724,28 @@ def parse_args():
     parser.add_argument(
         "--void-field",
         default="void_ratio",
-        help="Name of the point-data scalar array to write.",
+        help="Name of the raw point-data scalar array to write.",
+    )
+    parser.add_argument(
+        "--smoothed-void-field",
+        default="void_ratio_smoothed",
+        help="Name of the Gaussian-smoothed point-data scalar array to write.",
+    )
+    parser.add_argument(
+        "--smooth-sigma",
+        type=float,
+        default=1.0,
+        help="Gaussian smoothing sigma in voxel units for the smoothed field.",
+    )
+    parser.add_argument(
+        "--negative-n-search-limit",
+        type=int,
+        default=100,
+        help=(
+            "If raw negative void ratios occur, search integer N values above "
+            "the current N through this limit and report the first with none. "
+            "Use 0 to disable the search."
+        ),
     )
     parser.add_argument(
         "--binary",
@@ -584,6 +780,10 @@ def main():
     args = parse_args()
     if args.particles_per_voxel <= 0.0:
         raise RuntimeError("--particles-per-voxel must be positive.")
+    if args.smooth_sigma < 0.0:
+        raise RuntimeError("--smooth-sigma must be non-negative.")
+    if args.negative_n_search_limit < 0:
+        raise RuntimeError("--negative-n-search-limit must be non-negative.")
 
     vtk, version_text = require_vtk_71(args.allow_other_vtk)
     output_path = args.output or default_output_path(args.input)
@@ -599,21 +799,31 @@ def main():
         )
 
     if hasattr(points, "shape"):
-        void_by_particle, stats = compute_void_ratio_numpy(
-            points, radii, args.particles_per_voxel
+        void_by_particle, smoothed_void_by_particle, stats = compute_void_ratio_numpy(
+            points, radii, args.particles_per_voxel, args.smooth_sigma
         )
     else:
-        void_by_particle, stats = compute_void_ratio_plain(
-            points, radii, args.particles_per_voxel
+        void_by_particle, smoothed_void_by_particle, stats = compute_void_ratio_plain(
+            points, radii, args.particles_per_voxel, args.smooth_sigma
         )
 
+    add_negative_void_ratio_recommendation(
+        points, radii, stats, args.negative_n_search_limit
+    )
+
     if args.vtk_writer:
-        add_void_ratio_array(vtk, polydata, args.void_field, void_by_particle)
+        add_point_scalar_array(vtk, polydata, args.void_field, void_by_particle)
+        add_point_scalar_array(
+            vtk, polydata, args.smoothed_void_field, smoothed_void_by_particle
+        )
         write_polydata(vtk, polydata, output_path, args.binary)
     else:
         if args.binary:
             raise RuntimeError("--binary requires --vtk-writer.")
         append_scalar_to_legacy_ascii(args.input, output_path, args.void_field, void_by_particle)
+        append_scalar_to_legacy_ascii(
+            output_path, output_path, args.smoothed_void_field, smoothed_void_by_particle
+        )
 
     print_stats(stats, output_path, version_text)
 
