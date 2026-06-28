@@ -740,7 +740,7 @@ def parse_args():
     parser.add_argument(
         "--negative-n-search-limit",
         type=int,
-        default=100,
+        default=30,
         help=(
             "If raw negative void ratios occur, search integer N values above "
             "the current N through this limit and report the first with none. "
