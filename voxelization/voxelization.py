@@ -11,12 +11,12 @@ Void ratio is computed as:
 
     e = (V_voxel - sum(V_sphere_particles_in_voxel)) / sum(V_sphere)
 
-Sphere volumes are assigned to the voxel containing each particle center.
-Interior voxels use the full cubic voxel volume. Boundary voxels are shortened
-on their outside face(s) to the local sphere extent of the particles assigned to
-that boundary voxel, reducing artificial empty space outside the particle cloud.
-A second point-data field stores a Gaussian-smoothed void ratio over occupied
-neighboring voxels.
+Particle spheres are clipped across voxel boundaries when accumulating solid
+volume, so a sphere contributes only the portion of its volume that lies inside
+each voxel it overlaps. Interior voxels use the full cubic voxel volume. Boundary
+voxels are shortened on their outside face(s) to the local sphere extent of the
+particles assigned to that boundary voxel. A second point-data field stores a
+Gaussian-smoothed void ratio over occupied neighboring voxels.
 """
 
 from __future__ import print_function
@@ -232,7 +232,175 @@ def choose_voxel_size_numpy(points, target_particles_per_voxel):
     return mins, maxs, best
 
 
-def compute_void_ratio_numpy(points, radii, target_particles_per_voxel, smooth_sigma):
+def make_sphere_clip_quadrature(order):
+    try:
+        import numpy as np
+    except ImportError:
+        return None, None
+    nodes, weights = np.polynomial.legendre.leggauss(order)
+    return nodes.astype(np.float64), weights.astype(np.float64)
+
+
+def sphere_box_intersection_volume_numpy(center, radius, box_min, box_max, nodes, weights):
+    import numpy as np
+
+    sphere_min = center - radius
+    sphere_max = center + radius
+    clipped_min = np.maximum(box_min, sphere_min)
+    clipped_max = np.minimum(box_max, sphere_max)
+    if np.any(clipped_max <= clipped_min):
+        return 0.0
+
+    if np.all(box_min <= sphere_min) and np.all(box_max >= sphere_max):
+        return (4.0 / 3.0) * math.pi * radius ** 3
+
+    x0, y0, z0 = clipped_min - center
+    x1, y1, z1 = clipped_max - center
+    x_mid = 0.5 * (x0 + x1)
+    y_mid = 0.5 * (y0 + y1)
+    x_half = 0.5 * (x1 - x0)
+    y_half = 0.5 * (y1 - y0)
+
+    x = x_mid + x_half * nodes
+    y = y_mid + y_half * nodes
+    xx = x[:, None]
+    yy = y[None, :]
+    remaining = radius * radius - xx * xx - yy * yy
+    valid = remaining > 0.0
+    z_radius = np.zeros_like(remaining)
+    z_radius[valid] = np.sqrt(remaining[valid])
+    z_low = np.maximum(z0, -z_radius)
+    z_high = np.minimum(z1, z_radius)
+    height = np.maximum(z_high - z_low, 0.0)
+    return float(x_half * y_half * np.sum((weights[:, None] * weights[None, :]) * height))
+
+
+def sphere_box_intersection_volume_plain(center, radius, box_min, box_max, nodes, weights):
+    sphere_min = [center[i] - radius for i in range(3)]
+    sphere_max = [center[i] + radius for i in range(3)]
+    clipped_min = [max(box_min[i], sphere_min[i]) for i in range(3)]
+    clipped_max = [min(box_max[i], sphere_max[i]) for i in range(3)]
+    if any(clipped_max[i] <= clipped_min[i] for i in range(3)):
+        return 0.0
+
+    if all(box_min[i] <= sphere_min[i] and box_max[i] >= sphere_max[i] for i in range(3)):
+        return (4.0 / 3.0) * math.pi * radius ** 3
+
+    x0, y0, z0 = [clipped_min[i] - center[i] for i in range(3)]
+    x1, y1, z1 = [clipped_max[i] - center[i] for i in range(3)]
+    x_mid = 0.5 * (x0 + x1)
+    y_mid = 0.5 * (y0 + y1)
+    x_half = 0.5 * (x1 - x0)
+    y_half = 0.5 * (y1 - y0)
+    total = 0.0
+    for node_x, weight_x in zip(nodes, weights):
+        x = x_mid + x_half * node_x
+        for node_y, weight_y in zip(nodes, weights):
+            y = y_mid + y_half * node_y
+            remaining = radius * radius - x * x - y * y
+            if remaining <= 0.0:
+                continue
+            z_radius = math.sqrt(remaining)
+            height = min(z1, z_radius) - max(z0, -z_radius)
+            if height > 0.0:
+                total += weight_x * weight_y * height
+    return x_half * y_half * total
+
+
+def accumulate_clipped_solid_numpy(
+    points, radii, mins, voxel_size, dims, unique_linear, box_min, box_max, order
+):
+    import numpy as np
+
+    nodes, weights = make_sphere_clip_quadrature(order)
+    linear_to_compact = {int(linear): i for i, linear in enumerate(unique_linear)}
+    solid_by_voxel = np.zeros(len(unique_linear), dtype=np.float64)
+
+    for center, radius in zip(points, radii):
+        low = np.floor((center - radius - mins) / voxel_size).astype(np.int64)
+        high = np.floor((center + radius - mins) / voxel_size).astype(np.int64)
+        low = np.maximum(low, 0)
+        high = np.minimum(high, dims - 1)
+        for ix in range(int(low[0]), int(high[0]) + 1):
+            for iy in range(int(low[1]), int(high[1]) + 1):
+                for iz in range(int(low[2]), int(high[2]) + 1):
+                    linear = ix + dims[0] * (iy + dims[1] * iz)
+                    compact = linear_to_compact.get(int(linear))
+                    if compact is None:
+                        continue
+                    solid_by_voxel[compact] += sphere_box_intersection_volume_numpy(
+                        center, float(radius), box_min[compact], box_max[compact], nodes, weights
+                    )
+    return solid_by_voxel
+
+
+def accumulate_clipped_solid_plain(
+    points, radii, mins, voxel_size, dims, occupied_keys, box_bounds_by_key, order
+):
+    nodes, weights = make_sphere_clip_quadrature(order)
+    if nodes is None:
+        nodes, weights = legendre_gauss_plain(order)
+
+    solid_by_voxel = {key: 0.0 for key in occupied_keys}
+    occupied = set(occupied_keys)
+    for center, radius in zip(points, radii):
+        low = [max(int(math.floor((center[i] - radius - mins[i]) / voxel_size)), 0) for i in range(3)]
+        high = [min(int(math.floor((center[i] + radius - mins[i]) / voxel_size)), dims[i] - 1) for i in range(3)]
+        for ix in range(low[0], high[0] + 1):
+            for iy in range(low[1], high[1] + 1):
+                for iz in range(low[2], high[2] + 1):
+                    key = (ix, iy, iz)
+                    if key not in occupied:
+                        continue
+                    box_min, box_max = box_bounds_by_key[key]
+                    solid_by_voxel[key] += sphere_box_intersection_volume_plain(
+                        center, radius, box_min, box_max, nodes, weights
+                    )
+    return solid_by_voxel
+
+
+def legendre_gauss_plain(order):
+    # Fallback tables for environments without NumPy in the plain path.
+    if order == 4:
+        nodes = [
+            -0.8611363115940526,
+            -0.3399810435848563,
+            0.3399810435848563,
+            0.8611363115940526,
+        ]
+        weights = [
+            0.3478548451374538,
+            0.6521451548625461,
+            0.6521451548625461,
+            0.3478548451374538,
+        ]
+    elif order == 8:
+        nodes = [
+            -0.9602898564975363,
+            -0.7966664774136267,
+            -0.5255324099163290,
+            -0.1834346424956498,
+            0.1834346424956498,
+            0.5255324099163290,
+            0.7966664774136267,
+            0.9602898564975363,
+        ]
+        weights = [
+            0.1012285362903763,
+            0.2223810344533745,
+            0.3137066458778873,
+            0.3626837833783620,
+            0.3626837833783620,
+            0.3137066458778873,
+            0.2223810344533745,
+            0.1012285362903763,
+        ]
+    else:
+        raise RuntimeError("Plain clipping fallback only supports --sphere-clip-order 4 or 8.")
+    return nodes, weights
+
+
+def compute_void_ratio_numpy(points, radii, target_particles_per_voxel, smooth_sigma, sphere_clip_order):
     import numpy as np
 
     mins, maxs, best = choose_voxel_size_numpy(points, target_particles_per_voxel)
@@ -246,20 +414,18 @@ def compute_void_ratio_numpy(points, radii, target_particles_per_voxel, smooth_s
         linear, return_index=True, return_inverse=True
     )
     voxel_indices = indices[unique_first]
-    sphere_volumes = (4.0 / 3.0) * math.pi * np.power(radii, 3)
-    solid_by_voxel = np.bincount(inverse, weights=sphere_volumes)
     counts_by_voxel = np.bincount(inverse)
 
     nominal_voxel_volume = voxel_size ** 3
     lower_sphere_extent = points - radii[:, None]
     upper_sphere_extent = points + radii[:, None]
-    local_min = np.full((solid_by_voxel.shape[0], 3), np.inf, dtype=np.float64)
-    local_max = np.full((solid_by_voxel.shape[0], 3), -np.inf, dtype=np.float64)
+    local_min = np.full((len(unique_linear), 3), np.inf, dtype=np.float64)
+    local_max = np.full((len(unique_linear), 3), -np.inf, dtype=np.float64)
     for axis in range(3):
         np.minimum.at(local_min[:, axis], inverse, lower_sphere_extent[:, axis])
         np.maximum.at(local_max[:, axis], inverse, upper_sphere_extent[:, axis])
 
-    lengths = np.full((solid_by_voxel.shape[0], 3), voxel_size, dtype=np.float64)
+    lengths = np.full((len(unique_linear), 3), voxel_size, dtype=np.float64)
     for axis in range(3):
         nominal_low = mins[axis] + voxel_indices[:, axis] * voxel_size
         nominal_high = nominal_low + voxel_size
@@ -276,9 +442,28 @@ def compute_void_ratio_numpy(points, radii, target_particles_per_voxel, smooth_s
         )
         lengths[:, axis] = np.maximum(adjusted_high - adjusted_low, 0.0)
 
-    measurement_volume_by_voxel = np.prod(lengths, axis=1)
+    box_min = np.empty((len(unique_linear), 3), dtype=np.float64)
+    box_max = np.empty((len(unique_linear), 3), dtype=np.float64)
+    for axis in range(3):
+        nominal_low = mins[axis] + voxel_indices[:, axis] * voxel_size
+        nominal_high = nominal_low + voxel_size
+        low_boundary = voxel_indices[:, axis] == 0
+        high_boundary = voxel_indices[:, axis] == dims[axis] - 1
+        box_min[:, axis] = nominal_low
+        box_max[:, axis] = nominal_high
+        box_min[low_boundary, axis] = np.maximum(
+            box_min[low_boundary, axis], local_min[low_boundary, axis]
+        )
+        box_max[high_boundary, axis] = np.minimum(
+            box_max[high_boundary, axis], local_max[high_boundary, axis]
+        )
+
+    measurement_volume_by_voxel = np.prod(box_max - box_min, axis=1)
     adjusted_boundary_voxels = int(
         np.count_nonzero(measurement_volume_by_voxel < nominal_voxel_volume)
+    )
+    solid_by_voxel = accumulate_clipped_solid_numpy(
+        points, radii, mins, voxel_size, dims, unique_linear, box_min, box_max, sphere_clip_order
     )
 
     void_by_voxel = (measurement_volume_by_voxel - solid_by_voxel) / solid_by_voxel
@@ -311,6 +496,7 @@ def compute_void_ratio_numpy(points, radii, target_particles_per_voxel, smooth_s
         "max_void_ratio": float(void_by_voxel.max()),
         "negative_void_ratio_voxels": int(np.count_nonzero(void_by_voxel < 0.0)),
         "smooth_sigma": float(smooth_sigma),
+        "sphere_clip_order": int(sphere_clip_order),
         "min_smoothed_void_ratio": float(smoothed_void_by_voxel.min()),
         "median_smoothed_void_ratio": float(np.median(smoothed_void_by_voxel)),
         "max_smoothed_void_ratio": float(smoothed_void_by_voxel.max()),
@@ -319,7 +505,7 @@ def compute_void_ratio_numpy(points, radii, target_particles_per_voxel, smooth_s
     return void_by_particle, smoothed_void_by_particle, stats
 
 
-def compute_void_ratio_plain(points, radii, target_particles_per_voxel, smooth_sigma):
+def compute_void_ratio_plain(points, radii, target_particles_per_voxel, smooth_sigma, sphere_clip_order):
     mins = [min(p[axis] for p in points) for axis in range(3)]
     maxs = [max(p[axis] for p in points) for axis in range(3)]
     extents = [maxs[i] - mins[i] for i in range(3)]
@@ -362,7 +548,7 @@ def compute_void_ratio_plain(points, radii, target_particles_per_voxel, smooth_s
             min(int((point[2] - mins[2]) / voxel_size), dims[2] - 1),
         )
         particle_keys.append(key)
-        solid_by_voxel[key] = solid_by_voxel.get(key, 0.0) + (4.0 / 3.0) * math.pi * radius ** 3
+        solid_by_voxel[key] = 0.0
         count_by_voxel[key] = count_by_voxel.get(key, 0) + 1
         lower = (point[0] - radius, point[1] - radius, point[2] - radius)
         upper = (point[0] + radius, point[1] + radius, point[2] + radius)
@@ -374,10 +560,11 @@ def compute_void_ratio_plain(points, radii, target_particles_per_voxel, smooth_s
                 local_min_by_voxel[key][axis] = min(local_min_by_voxel[key][axis], lower[axis])
                 local_max_by_voxel[key][axis] = max(local_max_by_voxel[key][axis], upper[axis])
 
-    void_by_voxel = {}
+    box_bounds_by_key = {}
+    measurement_volume_by_key = {}
     measurement_volumes = []
     adjusted_boundary_voxels = 0
-    for key, solid in solid_by_voxel.items():
+    for key in solid_by_voxel:
         lengths = []
         for axis in range(3):
             nominal_low = mins[axis] + key[axis] * voxel_size
@@ -393,7 +580,28 @@ def compute_void_ratio_plain(points, radii, target_particles_per_voxel, smooth_s
         if measurement_volume < nominal_voxel_volume:
             adjusted_boundary_voxels += 1
         measurement_volumes.append(measurement_volume)
-        void_by_voxel[key] = (measurement_volume - solid) / solid
+        measurement_volume_by_key[key] = measurement_volume
+        box_bounds_by_key[key] = (
+            [
+                mins[axis] + key[axis] * voxel_size
+                if key[axis] != 0
+                else max(mins[axis] + key[axis] * voxel_size, local_min_by_voxel[key][axis])
+                for axis in range(3)
+            ],
+            [
+                mins[axis] + (key[axis] + 1) * voxel_size
+                if key[axis] != dims[axis] - 1
+                else min(mins[axis] + (key[axis] + 1) * voxel_size, local_max_by_voxel[key][axis])
+                for axis in range(3)
+            ],
+        )
+
+    solid_by_voxel = accumulate_clipped_solid_plain(
+        points, radii, mins, voxel_size, dims, solid_by_voxel.keys(), box_bounds_by_key, sphere_clip_order
+    )
+    void_by_voxel = {}
+    for key, solid in solid_by_voxel.items():
+        void_by_voxel[key] = (measurement_volume_by_key[key] - solid) / solid
 
     smoothed_void_by_voxel = gaussian_smooth_occupied_plain(
         solid_by_voxel.keys(), void_by_voxel, smooth_sigma
@@ -430,59 +638,12 @@ def compute_void_ratio_plain(points, radii, target_particles_per_voxel, smooth_s
         "max_void_ratio": max(void_values),
         "negative_void_ratio_voxels": sum(1 for value in void_values if value < 0.0),
         "smooth_sigma": float(smooth_sigma),
+        "sphere_clip_order": int(sphere_clip_order),
         "min_smoothed_void_ratio": min(smoothed_void_values),
         "median_smoothed_void_ratio": smoothed_void_sorted[len(smoothed_void_sorted) // 2],
         "max_smoothed_void_ratio": max(smoothed_void_values),
     }
     return void_by_particle, smoothed_void_by_particle, stats
-
-
-def find_smallest_n_without_negative_void_ratio(
-    points, radii, search_start_n, search_limit_n
-):
-    if search_limit_n < search_start_n:
-        return None, None
-
-    use_numpy = hasattr(points, "shape")
-    for candidate_n in range(search_start_n, search_limit_n + 1):
-        if use_numpy:
-            _, _, candidate_stats = compute_void_ratio_numpy(
-                points, radii, float(candidate_n), 0.0
-            )
-        else:
-            _, _, candidate_stats = compute_void_ratio_plain(
-                points, radii, float(candidate_n), 0.0
-            )
-        if candidate_stats["negative_void_ratio_voxels"] == 0:
-            return candidate_n, candidate_stats
-    return None, None
-
-
-def add_negative_void_ratio_recommendation(points, radii, stats, search_limit_n):
-    stats["negative_n_search_limit"] = int(search_limit_n)
-    stats["nonnegative_recommended_n"] = None
-    stats["nonnegative_recommended_dims"] = None
-    stats["nonnegative_recommended_min_void_ratio"] = None
-
-    if stats["negative_void_ratio_voxels"] == 0 or search_limit_n <= 0:
-        return
-
-    current_n = stats["target_particles_per_voxel"]
-    search_start_n = max(1, int(math.ceil(current_n)))
-    if abs(float(search_start_n) - float(current_n)) < 1.0e-12:
-        search_start_n += 1
-
-    recommended_n, recommended_stats = find_smallest_n_without_negative_void_ratio(
-        points, radii, search_start_n, int(search_limit_n)
-    )
-    if recommended_n is None:
-        return
-
-    stats["nonnegative_recommended_n"] = int(recommended_n)
-    stats["nonnegative_recommended_dims"] = recommended_stats["dims"]
-    stats["nonnegative_recommended_min_void_ratio"] = recommended_stats[
-        "min_void_ratio"
-    ]
 
 
 def add_point_scalar_array(vtk, polydata, field_name, values):
@@ -658,31 +819,12 @@ def print_stats(stats, output_path, version_text):
     )
     if stats["negative_void_ratio_voxels"] > 0:
         print(
-            "WARNING: Negative raw void ratios occurred for the current N. "
-            "This means assigned sphere volume exceeded adjusted voxel volume "
-            "in those voxels."
+            "WARNING: Negative raw void ratios occurred. This means clipped "
+            "solid volume still exceeded adjusted voxel volume in those voxels. "
+            "Try a higher --sphere-clip-order for a more accurate sphere/voxel "
+            "intersection estimate."
         )
-        if stats.get("nonnegative_recommended_n") is not None:
-            print(
-                "Smallest integer N above the current N with no negative raw "
-                "void ratios: {0}".format(stats["nonnegative_recommended_n"])
-            )
-            print(
-                "Recommended N voxel dimensions: {0}".format(
-                    stats["nonnegative_recommended_dims"]
-                )
-            )
-            print(
-                "Recommended N minimum void ratio: {0:.6g}".format(
-                    stats["nonnegative_recommended_min_void_ratio"]
-                )
-            )
-        elif stats.get("negative_n_search_limit", 0) > 0:
-            print(
-                "No integer N up to {0} eliminated negative raw void ratios.".format(
-                    stats["negative_n_search_limit"]
-                )
-            )
+    print("Sphere clipping quadrature order: {0}".format(stats["sphere_clip_order"]))
     print("Gaussian smoothing sigma: {0:g} voxel(s)".format(stats["smooth_sigma"]))
     print(
         "Smoothed void ratio min/median/max: {0:.6g} / {1:.6g} / {2:.6g}".format(
@@ -738,13 +880,12 @@ def parse_args():
         help="Gaussian smoothing sigma in voxel units for the smoothed field.",
     )
     parser.add_argument(
-        "--negative-n-search-limit",
+        "--sphere-clip-order",
         type=int,
-        default=30,
+        default=4,
         help=(
-            "If raw negative void ratios occur, search integer N values above "
-            "the current N through this limit and report the first with none. "
-            "Use 0 to disable the search."
+            "Gauss-Legendre quadrature order used for sphere-box clipping. "
+            "Higher values are more accurate but slower."
         ),
     )
     parser.add_argument(
@@ -782,8 +923,8 @@ def main():
         raise RuntimeError("--particles-per-voxel must be positive.")
     if args.smooth_sigma < 0.0:
         raise RuntimeError("--smooth-sigma must be non-negative.")
-    if args.negative_n_search_limit < 0:
-        raise RuntimeError("--negative-n-search-limit must be non-negative.")
+    if args.sphere_clip_order <= 0:
+        raise RuntimeError("--sphere-clip-order must be positive.")
 
     vtk, version_text = require_vtk_71(args.allow_other_vtk)
     output_path = args.output or default_output_path(args.input)
@@ -800,16 +941,12 @@ def main():
 
     if hasattr(points, "shape"):
         void_by_particle, smoothed_void_by_particle, stats = compute_void_ratio_numpy(
-            points, radii, args.particles_per_voxel, args.smooth_sigma
+            points, radii, args.particles_per_voxel, args.smooth_sigma, args.sphere_clip_order
         )
     else:
         void_by_particle, smoothed_void_by_particle, stats = compute_void_ratio_plain(
-            points, radii, args.particles_per_voxel, args.smooth_sigma
+            points, radii, args.particles_per_voxel, args.smooth_sigma, args.sphere_clip_order
         )
-
-    add_negative_void_ratio_recommendation(
-        points, radii, stats, args.negative_n_search_limit
-    )
 
     if args.vtk_writer:
         add_point_scalar_array(vtk, polydata, args.void_field, void_by_particle)
