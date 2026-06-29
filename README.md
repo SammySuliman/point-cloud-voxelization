@@ -15,8 +15,9 @@ Name of the Gaussian-smoothed void-ratio output field. Default: void_ratio_smoot
 --smooth-sigma \
 Gaussian smoothing sigma in voxel units. Default: 1.0. Use 0 to effectively disable smoothing. \
 \
---negative-n-search-limit \
-If negative raw void ratios occur, search integer N values above current N up to this limit and report the first one with no negatives. Default: 100. Use 0 to disable the search. \
+--sphere-clip-order \
+Controls the numerical accuracy of the sphere/voxel intersection calculation. When a particle sphere overlaps a voxel, the script estimates: volume(sphere ∩ voxel)
+using Gauss-Legendre quadrature. The clip order is the number of quadrature sample points used along each integration direction. \
 \
 --binary \
 Write binary legacy VTK. Only works with --vtk-writer. \
