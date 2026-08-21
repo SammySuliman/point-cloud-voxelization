@@ -1,7 +1,6 @@
 annotated-doc==0.0.4
 annotated-types==0.7.0
 anyio==4.13.0
--e git+https://github.com/SammySuliman/LinguaSwitch.git@2e29786cb74bc72530076befce1eb248d06722ac#egg=bilingual_bot&subdirectory=linguaswitch\apps\api
 build==1.5.0
 certifi==2026.5.20
 cffi==2.0.0
@@ -39,7 +38,6 @@ python-dotenv==1.2.2
 pywin32-ctypes==0.2.3
 PyYAML==6.0.3
 readme_renderer==45.0
--e git+https://github.com/SammySuliman/ReducedGridSearchCV.git@2527cc47f83deae9cc5e483ef96d68fe8c6aa310#egg=reduced_grid_search_cv
 requests==2.34.2
 requests-toolbelt==1.0.0
 rfc3986==2.0.0
