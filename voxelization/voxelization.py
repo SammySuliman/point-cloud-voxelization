@@ -16,7 +16,8 @@ volume, so a sphere contributes only the portion of its volume that lies inside
 each voxel it overlaps. Interior voxels use the full cubic voxel volume. Boundary
 voxels are shortened on their outside face(s) to the local sphere extent of the
 particles assigned to that boundary voxel. A second point-data field stores a
-Gaussian-smoothed void ratio over occupied neighboring voxels.
+face-reconstructed value obtained from the voxel value, six neighbor-averaged
+face values, and two-point Gauss quadrature inside each voxel.
 """
 
 from __future__ import print_function
@@ -132,73 +133,119 @@ def load_points_and_radii(polydata, radius_array):
     return coords, radii
 
 
-def gaussian_smooth_occupied_numpy(voxel_indices, values_by_voxel, dims, sigma):
+def face_reconstructed_gauss_smooth_numpy(voxel_indices, values_by_voxel, dims):
     import numpy as np
 
-    if sigma <= 0.0:
-        return values_by_voxel.copy()
-
-    radius = int(math.ceil(3.0 * sigma))
     shape = tuple(int(v) for v in dims)
-    values_grid = np.zeros(shape, dtype=np.float64)
-    occupied_grid = np.zeros(shape, dtype=np.float64)
+    compact_grid = np.full(shape, -1, dtype=np.int64)
     coords = tuple(voxel_indices[:, axis] for axis in range(3))
-    values_grid[coords] = values_by_voxel
-    occupied_grid[coords] = 1.0
+    compact_grid[coords] = np.arange(values_by_voxel.shape[0], dtype=np.int64)
 
-    weighted_sum = np.zeros(shape, dtype=np.float64)
-    weight_sum = np.zeros(shape, dtype=np.float64)
+    face_values = np.empty((values_by_voxel.shape[0], 6), dtype=np.float64)
+    directions = [
+        (0, -1),
+        (0, 1),
+        (1, -1),
+        (1, 1),
+        (2, -1),
+        (2, 1),
+    ]
 
-    for dx in range(-radius, radius + 1):
-        for dy in range(-radius, radius + 1):
-            for dz in range(-radius, radius + 1):
-                distance_sq = dx * dx + dy * dy + dz * dz
-                weight = math.exp(-distance_sq / (2.0 * sigma * sigma))
+    for face_index, (axis, step) in enumerate(directions):
+        neighbor_indices = voxel_indices.copy()
+        neighbor_indices[:, axis] += step
+        valid = (neighbor_indices[:, axis] >= 0) & (neighbor_indices[:, axis] < dims[axis])
+        neighbor_compact = np.full(values_by_voxel.shape[0], -1, dtype=np.int64)
+        valid_rows = np.where(valid)[0]
+        if valid_rows.size:
+            lookup = tuple(neighbor_indices[valid_rows, dim] for dim in range(3))
+            neighbor_compact[valid_rows] = compact_grid[lookup]
+        has_neighbor = neighbor_compact >= 0
+        face_values[:, face_index] = values_by_voxel
+        face_values[has_neighbor, face_index] = 0.5 * (
+            values_by_voxel[has_neighbor] + values_by_voxel[neighbor_compact[has_neighbor]]
+        )
 
-                target_slices = []
-                source_slices = []
-                for offset, size in ((dx, shape[0]), (dy, shape[1]), (dz, shape[2])):
-                    if offset >= 0:
-                        target_slices.append(slice(offset, size))
-                        source_slices.append(slice(0, size - offset))
-                    else:
-                        target_slices.append(slice(0, size + offset))
-                        source_slices.append(slice(-offset, size))
-
-                target = tuple(target_slices)
-                source = tuple(source_slices)
-                weighted_sum[target] += weight * values_grid[source] * occupied_grid[source]
-                weight_sum[target] += weight * occupied_grid[source]
-
-    smoothed_grid = np.empty(shape, dtype=np.float64)
-    np.divide(weighted_sum, weight_sum, out=smoothed_grid, where=weight_sum > 0.0)
-    smoothed_grid[weight_sum == 0.0] = values_grid[weight_sum == 0.0]
-    return smoothed_grid[coords]
+    return evaluate_face_reconstruction_at_gauss_numpy(values_by_voxel, face_values)
 
 
-def gaussian_smooth_occupied_plain(voxel_keys, values_by_voxel, sigma):
-    if sigma <= 0.0:
-        return dict(values_by_voxel)
+def evaluate_face_reconstruction_at_gauss_numpy(center_values, face_values):
+    import numpy as np
 
-    radius = int(math.ceil(3.0 * sigma))
+    e0 = center_values
+    ex_minus = face_values[:, 0]
+    ex_plus = face_values[:, 1]
+    ey_minus = face_values[:, 2]
+    ey_plus = face_values[:, 3]
+    ez_minus = face_values[:, 4]
+    ez_plus = face_values[:, 5]
+
+    ax = 0.5 * (ex_plus - ex_minus)
+    bx = 0.5 * (ex_plus + ex_minus) - e0
+    ay = 0.5 * (ey_plus - ey_minus)
+    by = 0.5 * (ey_plus + ey_minus) - e0
+    az = 0.5 * (ez_plus - ez_minus)
+    bz = 0.5 * (ez_plus + ez_minus) - e0
+
+    gp = 1.0 / math.sqrt(3.0)
+    total = np.zeros_like(e0)
+    count = 0
+    for xi in (-gp, gp):
+        for eta in (-gp, gp):
+            for zeta in (-gp, gp):
+                total += (
+                    e0
+                    + ax * xi + bx * xi * xi
+                    + ay * eta + by * eta * eta
+                    + az * zeta + bz * zeta * zeta
+                )
+                count += 1
+    return total / float(count)
+
+
+def face_reconstructed_gauss_smooth_plain(voxel_keys, values_by_voxel):
+    voxel_keys = list(voxel_keys)
+    occupied = set(voxel_keys)
     smoothed = {}
-    offsets = []
-    for dx in range(-radius, radius + 1):
-        for dy in range(-radius, radius + 1):
-            for dz in range(-radius, radius + 1):
-                distance_sq = dx * dx + dy * dy + dz * dz
-                offsets.append((dx, dy, dz, math.exp(-distance_sq / (2.0 * sigma * sigma))))
 
     for key in voxel_keys:
-        weighted_sum = 0.0
-        weight_sum = 0.0
-        for dx, dy, dz, weight in offsets:
-            neighbor = (key[0] + dx, key[1] + dy, key[2] + dz)
-            if neighbor in values_by_voxel:
-                weighted_sum += weight * values_by_voxel[neighbor]
-                weight_sum += weight
-        smoothed[key] = weighted_sum / weight_sum if weight_sum > 0.0 else values_by_voxel[key]
+        e0 = values_by_voxel[key]
+        face_values = []
+        for axis, step in ((0, -1), (0, 1), (1, -1), (1, 1), (2, -1), (2, 1)):
+            neighbor = list(key)
+            neighbor[axis] += step
+            neighbor = tuple(neighbor)
+            if neighbor in occupied:
+                face_values.append(0.5 * (e0 + values_by_voxel[neighbor]))
+            else:
+                face_values.append(e0)
+        smoothed[key] = evaluate_face_reconstruction_at_gauss_plain(e0, face_values)
     return smoothed
+
+
+def evaluate_face_reconstruction_at_gauss_plain(e0, face_values):
+    ex_minus, ex_plus, ey_minus, ey_plus, ez_minus, ez_plus = face_values
+    ax = 0.5 * (ex_plus - ex_minus)
+    bx = 0.5 * (ex_plus + ex_minus) - e0
+    ay = 0.5 * (ey_plus - ey_minus)
+    by = 0.5 * (ey_plus + ey_minus) - e0
+    az = 0.5 * (ez_plus - ez_minus)
+    bz = 0.5 * (ez_plus + ez_minus) - e0
+
+    gp = 1.0 / math.sqrt(3.0)
+    total = 0.0
+    count = 0
+    for xi in (-gp, gp):
+        for eta in (-gp, gp):
+            for zeta in (-gp, gp):
+                total += (
+                    e0
+                    + ax * xi + bx * xi * xi
+                    + ay * eta + by * eta * eta
+                    + az * zeta + bz * zeta * zeta
+                )
+                count += 1
+    return total / float(count)
 
 
 def choose_voxel_size_numpy(points, target_particles_per_voxel):
@@ -361,7 +408,16 @@ def accumulate_clipped_solid_plain(
 
 def legendre_gauss_plain(order):
     # Fallback tables for environments without NumPy in the plain path.
-    if order == 4:
+    if order == 2:
+        nodes = [
+            -0.5773502691896257,
+            0.5773502691896257,
+        ]
+        weights = [
+            1.0,
+            1.0,
+        ]
+    elif order == 4:
         nodes = [
             -0.8611363115940526,
             -0.3399810435848563,
@@ -396,11 +452,11 @@ def legendre_gauss_plain(order):
             0.1012285362903763,
         ]
     else:
-        raise RuntimeError("Plain clipping fallback only supports --sphere-clip-order 4 or 8.")
+        raise RuntimeError("Plain quadrature fallback only supports orders 2, 4, or 8.")
     return nodes, weights
 
 
-def compute_void_ratio_numpy(points, radii, target_particles_per_voxel, smooth_sigma, sphere_clip_order):
+def compute_void_ratio_numpy(points, radii, target_particles_per_voxel, sphere_clip_order):
     import numpy as np
 
     mins, maxs, best = choose_voxel_size_numpy(points, target_particles_per_voxel)
@@ -467,11 +523,21 @@ def compute_void_ratio_numpy(points, radii, target_particles_per_voxel, smooth_s
     )
 
     void_by_voxel = (measurement_volume_by_voxel - solid_by_voxel) / solid_by_voxel
-    smoothed_void_by_voxel = gaussian_smooth_occupied_numpy(
-        voxel_indices, void_by_voxel, dims, smooth_sigma
+    smoothed_void_by_voxel = face_reconstructed_gauss_smooth_numpy(
+        voxel_indices, void_by_voxel, dims
     )
     void_by_particle = void_by_voxel[inverse]
     smoothed_void_by_particle = smoothed_void_by_voxel[inverse]
+    voxel_data = {
+        "box_min": box_min,
+        "box_max": box_max,
+        "void_ratio": void_by_voxel,
+        "void_ratio_smoothed": smoothed_void_by_voxel,
+        "particle_count": counts_by_voxel,
+        "solid_volume": solid_by_voxel,
+        "measurement_volume": measurement_volume_by_voxel,
+        "voxel_indices": voxel_indices,
+    }
 
     stats = {
         "point_count": int(points.shape[0]),
@@ -495,17 +561,18 @@ def compute_void_ratio_numpy(points, radii, target_particles_per_voxel, smooth_s
         "median_void_ratio": float(np.median(void_by_voxel)),
         "max_void_ratio": float(void_by_voxel.max()),
         "negative_void_ratio_voxels": int(np.count_nonzero(void_by_voxel < 0.0)),
-        "smooth_sigma": float(smooth_sigma),
+        "smooth_method": "face_reconstructed_two_point_gauss",
+        "gauss_point_count": 8,
         "sphere_clip_order": int(sphere_clip_order),
         "min_smoothed_void_ratio": float(smoothed_void_by_voxel.min()),
         "median_smoothed_void_ratio": float(np.median(smoothed_void_by_voxel)),
         "max_smoothed_void_ratio": float(smoothed_void_by_voxel.max()),
         "unique_linear_voxels": unique_linear,
     }
-    return void_by_particle, smoothed_void_by_particle, stats
+    return void_by_particle, smoothed_void_by_particle, stats, voxel_data
 
 
-def compute_void_ratio_plain(points, radii, target_particles_per_voxel, smooth_sigma, sphere_clip_order):
+def compute_void_ratio_plain(points, radii, target_particles_per_voxel, sphere_clip_order):
     mins = [min(p[axis] for p in points) for axis in range(3)]
     maxs = [max(p[axis] for p in points) for axis in range(3)]
     extents = [maxs[i] - mins[i] for i in range(3)]
@@ -603,17 +670,28 @@ def compute_void_ratio_plain(points, radii, target_particles_per_voxel, smooth_s
     for key, solid in solid_by_voxel.items():
         void_by_voxel[key] = (measurement_volume_by_key[key] - solid) / solid
 
-    smoothed_void_by_voxel = gaussian_smooth_occupied_plain(
-        solid_by_voxel.keys(), void_by_voxel, smooth_sigma
+    smoothed_void_by_voxel = face_reconstructed_gauss_smooth_plain(
+        solid_by_voxel.keys(), void_by_voxel
     )
     void_by_particle = [void_by_voxel[key] for key in particle_keys]
     smoothed_void_by_particle = [smoothed_void_by_voxel[key] for key in particle_keys]
     void_values = list(void_by_voxel.values())
     smoothed_void_values = list(smoothed_void_by_voxel.values())
     counts = list(count_by_voxel.values())
+    voxel_keys = list(solid_by_voxel.keys())
     void_sorted = sorted(void_values)
     smoothed_void_sorted = sorted(smoothed_void_values)
     measurement_sorted = sorted(measurement_volumes)
+    voxel_data = {
+        "box_min": [box_bounds_by_key[key][0] for key in voxel_keys],
+        "box_max": [box_bounds_by_key[key][1] for key in voxel_keys],
+        "void_ratio": [void_by_voxel[key] for key in voxel_keys],
+        "void_ratio_smoothed": [smoothed_void_by_voxel[key] for key in voxel_keys],
+        "particle_count": [count_by_voxel[key] for key in voxel_keys],
+        "solid_volume": [solid_by_voxel[key] for key in voxel_keys],
+        "measurement_volume": [measurement_volume_by_key[key] for key in voxel_keys],
+        "voxel_indices": voxel_keys,
+    }
 
     stats = {
         "point_count": len(points),
@@ -637,13 +715,90 @@ def compute_void_ratio_plain(points, radii, target_particles_per_voxel, smooth_s
         "median_void_ratio": void_sorted[len(void_sorted) // 2],
         "max_void_ratio": max(void_values),
         "negative_void_ratio_voxels": sum(1 for value in void_values if value < 0.0),
-        "smooth_sigma": float(smooth_sigma),
+        "smooth_method": "face_reconstructed_two_point_gauss",
+        "gauss_point_count": 8,
         "sphere_clip_order": int(sphere_clip_order),
         "min_smoothed_void_ratio": min(smoothed_void_values),
         "median_smoothed_void_ratio": smoothed_void_sorted[len(smoothed_void_sorted) // 2],
         "max_smoothed_void_ratio": max(smoothed_void_values),
     }
-    return void_by_particle, smoothed_void_by_particle, stats
+    return void_by_particle, smoothed_void_by_particle, stats, voxel_data
+
+
+def write_voxel_cells_legacy_ascii(output_path, voxel_data, raw_field_name, smoothed_field_name):
+    box_min = voxel_data["box_min"]
+    box_max = voxel_data["box_max"]
+    raw_values = voxel_data["void_ratio"]
+    smoothed_values = voxel_data["void_ratio_smoothed"]
+    particle_counts = voxel_data["particle_count"]
+    solid_volumes = voxel_data["solid_volume"]
+    measurement_volumes = voxel_data["measurement_volume"]
+    cell_count = len(raw_values)
+    point_count = cell_count * 8
+
+    def point_tuple(bounds_min, bounds_max, local_index):
+        xmin, ymin, zmin = [float(v) for v in bounds_min]
+        xmax, ymax, zmax = [float(v) for v in bounds_max]
+        points = (
+            (xmin, ymin, zmin),
+            (xmax, ymin, zmin),
+            (xmin, ymax, zmin),
+            (xmax, ymax, zmin),
+            (xmin, ymin, zmax),
+            (xmax, ymin, zmax),
+            (xmin, ymax, zmax),
+            (xmax, ymax, zmax),
+        )
+        return points[local_index]
+
+    with open(output_path, "w") as file_obj:
+        file_obj.write("# vtk DataFile Version 2.0\n")
+        file_obj.write("Voxelized void ratio cells\n")
+        file_obj.write("ASCII\n")
+        file_obj.write("DATASET UNSTRUCTURED_GRID\n")
+        file_obj.write("POINTS {0} float\n".format(point_count))
+        for cell_index in range(cell_count):
+            for local_index in range(8):
+                x, y, z = point_tuple(box_min[cell_index], box_max[cell_index], local_index)
+                file_obj.write("{0:.17g} {1:.17g} {2:.17g}\n".format(x, y, z))
+
+        file_obj.write("CELLS {0} {1}\n".format(cell_count, cell_count * 9))
+        for cell_index in range(cell_count):
+            start = cell_index * 8
+            file_obj.write(
+                "8 {0} {1} {2} {3} {4} {5} {6} {7}\n".format(
+                    start,
+                    start + 1,
+                    start + 2,
+                    start + 3,
+                    start + 4,
+                    start + 5,
+                    start + 6,
+                    start + 7,
+                )
+            )
+
+        file_obj.write("CELL_TYPES {0}\n".format(cell_count))
+        for _ in range(cell_count):
+            file_obj.write("11\n")
+
+        file_obj.write("CELL_DATA {0}\n".format(cell_count))
+        write_cell_scalar(file_obj, raw_field_name, "double", raw_values)
+        write_cell_scalar(file_obj, smoothed_field_name, "double", smoothed_values)
+        write_cell_scalar(file_obj, "particle_count", "int", particle_counts)
+        write_cell_scalar(file_obj, "solid_volume", "double", solid_volumes)
+        write_cell_scalar(file_obj, "measurement_volume", "double", measurement_volumes)
+
+
+def write_cell_scalar(file_obj, name, vtk_type, values):
+    file_obj.write("SCALARS {0} {1} 1\n".format(name, vtk_type))
+    file_obj.write("LOOKUP_TABLE default\n")
+    if vtk_type == "int":
+        for value in values:
+            file_obj.write("{0}\n".format(int(value)))
+    else:
+        for value in values:
+            file_obj.write("{0:.17g}\n".format(float(value)))
 
 
 def add_point_scalar_array(vtk, polydata, field_name, values):
@@ -825,7 +980,8 @@ def print_stats(stats, output_path, version_text):
             "intersection estimate."
         )
     print("Sphere clipping quadrature order: {0}".format(stats["sphere_clip_order"]))
-    print("Gaussian smoothing sigma: {0:g} voxel(s)".format(stats["smooth_sigma"]))
+    print("Smoothing method: {0}".format(stats["smooth_method"]))
+    print("Gauss points per voxel reconstruction: {0}".format(stats["gauss_point_count"]))
     print(
         "Smoothed void ratio min/median/max: {0:.6g} / {1:.6g} / {2:.6g}".format(
             stats["min_smoothed_void_ratio"],
@@ -871,13 +1027,15 @@ def parse_args():
     parser.add_argument(
         "--smoothed-void-field",
         default="void_ratio_smoothed",
-        help="Name of the Gaussian-smoothed point-data scalar array to write.",
+        help="Name of the face-reconstructed Gauss point-data scalar array to write.",
     )
     parser.add_argument(
-        "--smooth-sigma",
-        type=float,
-        default=1.0,
-        help="Gaussian smoothing sigma in voxel units for the smoothed field.",
+        "--voxel-output",
+        default=None,
+        help=(
+            "Optional output VTK file containing one VTK_VOXEL cell per occupied "
+            "voxel with void-ratio values written as CELL_DATA."
+        ),
     )
     parser.add_argument(
         "--sphere-clip-order",
@@ -921,8 +1079,6 @@ def main():
     args = parse_args()
     if args.particles_per_voxel <= 0.0:
         raise RuntimeError("--particles-per-voxel must be positive.")
-    if args.smooth_sigma < 0.0:
-        raise RuntimeError("--smooth-sigma must be non-negative.")
     if args.sphere_clip_order <= 0:
         raise RuntimeError("--sphere-clip-order must be positive.")
 
@@ -940,12 +1096,18 @@ def main():
         )
 
     if hasattr(points, "shape"):
-        void_by_particle, smoothed_void_by_particle, stats = compute_void_ratio_numpy(
-            points, radii, args.particles_per_voxel, args.smooth_sigma, args.sphere_clip_order
+        void_by_particle, smoothed_void_by_particle, stats, voxel_data = compute_void_ratio_numpy(
+            points,
+            radii,
+            args.particles_per_voxel,
+            args.sphere_clip_order,
         )
     else:
-        void_by_particle, smoothed_void_by_particle, stats = compute_void_ratio_plain(
-            points, radii, args.particles_per_voxel, args.smooth_sigma, args.sphere_clip_order
+        void_by_particle, smoothed_void_by_particle, stats, voxel_data = compute_void_ratio_plain(
+            points,
+            radii,
+            args.particles_per_voxel,
+            args.sphere_clip_order,
         )
 
     if args.vtk_writer:
@@ -961,6 +1123,15 @@ def main():
         append_scalar_to_legacy_ascii(
             output_path, output_path, args.smoothed_void_field, smoothed_void_by_particle
         )
+
+    if args.voxel_output:
+        write_voxel_cells_legacy_ascii(
+            args.voxel_output,
+            voxel_data,
+            args.void_field,
+            args.smoothed_void_field,
+        )
+        print("Voxel-cell output: {0}".format(args.voxel_output))
 
     print_stats(stats, output_path, version_text)
 
