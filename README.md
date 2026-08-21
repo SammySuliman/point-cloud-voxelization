@@ -1,29 +1,82 @@
-To add void ratio file to an existing vtk:
-python .\voxelization.py .\name_of_original_vtk.vtk -n [number of desired voxels]
+# Voxelization Void Ratio Workflow
 
-Example:
-python .\voxelization.py .\prestress2800000.vtk -n 10
+This folder contains scripts for computing voxel-based void ratio fields from a legacy ASCII VTK particle point cloud.
 
-Additional arguments: \
-\
---void-field \
-Name of the raw void-ratio output field. Default: void_ratio \
-\
---smoothed-void-field \
-Name of the Gaussian-smoothed void-ratio output field. Default: void_ratio_smoothed \
-\
---smooth-sigma \
-Gaussian smoothing sigma in voxel units. Default: 1.0. Use 0 to effectively disable smoothing. \
-\
---sphere-clip-order \
-Controls the numerical accuracy of the sphere/voxel intersection calculation. When a particle sphere overlaps a voxel, the script estimates: volume(sphere ∩ voxel)
-using Gauss-Legendre quadrature. The clip order is the number of quadrature sample points used along each integration direction. \
-\
---binary \
-Write binary legacy VTK. Only works with --vtk-writer. \
-\
---allow-other-vtk \
-Allow running with VTK versions other than 7.1. \
-\
---vtk-writer \
-Use VTK reader/writer instead of the default legacy ASCII append mode. I do not recommend this for your current file because VTK 7.1 was not loading all arrays reliably.
+## Main Script
+
+Use `voxelization.py` to read the particle positions and `radius` field, voxelize the point cloud, compute raw and face-reconstructed void ratio fields, and write them back to VTK.
+
+Typical command:
+
+```powershell
+python .\voxelization.py .\prestress2800000.vtk -n 10 --sphere-clip-order 4
+```
+
+This creates the default particle-output file:
+
+```text
+prestress2800000_void_ratio.vtk
+```
+
+That file remains a `POLYDATA` point-cloud file. It stores the computed values as `POINT_DATA`, so ParaView colors the original particles rather than actual voxel cells.
+
+## Voxel Cell Output
+
+To also create a file that displays actual voxel cells in ParaView, add the `--voxel-output` parameter:
+
+```powershell
+python .\voxelization.py .\prestress2800000.vtk -n 10 --sphere-clip-order 4 --voxel-output .\prestress2800000_voxel_cells.vtk
+```
+
+The `--voxel-output` file is written as a legacy VTK `UNSTRUCTURED_GRID` with one `VTK_VOXEL` cell per occupied voxel. The fields are written as `CELL_DATA`:
+
+```text
+void_ratio
+void_ratio_smoothed
+particle_count
+solid_volume
+measurement_volume
+```
+
+Open the voxel-cell file in ParaView and use:
+
+```text
+Representation: Surface With Edges
+Coloring: void_ratio_smoothed
+```
+
+This makes the voxel grid directly visible, which is useful for checking whether apparent spacing or banding is coming from the voxel field itself rather than from plotting point data on the original particles.
+
+## Important Parameters
+
+`-n`, `--particles-per-voxel`
+
+Target average number of particles per occupied voxel. Larger values create larger voxels.
+
+`--sphere-clip-order`
+
+Gauss-Legendre quadrature order for estimating sphere/voxel intersection volumes. Default is `4`. Higher values are more accurate but slower.
+
+`--void-field`
+
+Name of the raw void-ratio field written to the output. Default:
+
+```text
+void_ratio
+```
+
+`--smoothed-void-field`
+
+Name of the face-reconstructed Gauss field written to the output. Default:
+
+```text
+void_ratio_smoothed
+```
+
+`--voxel-output`
+
+Optional path for an additional VTK file containing actual voxel cells. Use this when you want to inspect voxel geometry in ParaView.
+
+`--allow-other-vtk`
+
+Allows the script to run with VTK versions other than 7.1. Avoid `--vtk-writer` unless you specifically need VTK reader/writer behavior.
